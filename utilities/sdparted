@@ -25,14 +25,14 @@ usage: $SCRIPTNAME [options]
 options:
 
  --fatsize|-fs SIZE[MG]     set the size of the fat32 partition to <SIZE>.
-                            default=total sdcard size - (ext + swap)
+                            default=total sdcard size - (ext + cache)
 						
  --extsize|-es SIZE[MG]     set the size of the ext partition to <SIZE>.
                             default=$EXTSIZE
 						
- --swapsize|-ss SIZE[MG]    set the size of the swap partition to <SIZE>.
-                            if set to 0, no swap partition will be created.
-                            default=$SWAPSIZE
+ --cachesize|-ss SIZE[MG]    set the size of the cache partition to <SIZE>.
+                            if set to 0, no cache partition will be created.
+                            default=$CACHESIZE
 						
  --extfs|-efs TYPE          set the filesystem of ext partition to <TYPE>.
                             valid types=ext2, ext3, ext4
@@ -60,10 +60,10 @@ options:
 
 
 examples:
- $SCRIPTNAME                     creates swap=$SWAPSIZE ext2=$EXTSIZE fat32=remaining free space
- $SCRIPTNAME -efs ext4           creates swap=$SWAPSIZE ext4=$EXTSIZE fat32=remaining free space
- $SCRIPTNAME -fs 1.5G -efs ext3  creates swap=$SWAPSIZE ext3=$EXTSIZE fat32=1536
- $SCRIPTNAME -es 256M -ss 0      creates no swap ext2=256 fat32=remaining free space
+ $SCRIPTNAME                     creates cache=$CACHESIZE ext2=$EXTSIZE fat32=remaining free space
+ $SCRIPTNAME -efs ext4           creates cache=$CACHESIZE ext4=$EXTSIZE fat32=remaining free space
+ $SCRIPTNAME -fs 1.5G -efs ext3  creates cache=$CACHESIZE ext3=$EXTSIZE fat32=1536
+ $SCRIPTNAME -es 256M -ss 0      creates no cache ext2=256 fat32=remaining free space
  $SCRIPTNAME -ufs ext4           upgrades ext partition to ext4
 
 DONEHELP
@@ -96,7 +96,7 @@ UnmountAll () {
 	echo -n "unmounting all partitions..."
 	umount "$FATPATH" > /dev/null 2>&1 >>"$LOGFILE"
 	umount "$EXTPATH" > /dev/null 2>&1 >>"$LOGFILE"
-	umount "$SWAPPATH" > /dev/null 2>&1 >>"$LOGFILE"
+	umount "$CACHEPATH" > /dev/null 2>&1 >>"$LOGFILE"
 	echo "done"
 	echo
 	
@@ -193,9 +193,9 @@ CalculatePartitions() {
 	# get size of sdcard in MB & do some math
 	SDSIZEMB=`"$CMPARTED" "$SDPATH" unit MB print | grep $SDPATH | cut -d" " -f3`
 	SDSIZE=${SDSIZEMB%MB}
-	[ -n "$FATSIZE" ] || FATSIZE=$(($SDSIZE - $EXTSIZE - $SWAPSIZE))
+	[ -n "$FATSIZE" ] || FATSIZE=$(($SDSIZE - $EXTSIZE - $CACHESIZE))
 	EXTEND=$(($FATSIZE + $EXTSIZE))
-	SWAPEND=$(($EXTEND + $SWAPSIZE))
+	CACHEEND=$(($EXTEND + $CACHESIZE))
 	
 	# check for fatsize of 0
 	[ $FATSIZE -le 0 ] && ShowError "must have a fat32 partition greater than 0MB"
@@ -206,7 +206,7 @@ CalculatePartitions() {
 	[ -z "$SDSIZE" ] && ShowError "zero-length argument passed to partition-calculator"
 	
 	# make sure we're not being asked to do the impossible
-	[ $(($FATSIZE + $EXTSIZE + $SWAPSIZE)) -gt $SDSIZE ] && [ -z "$IMODE" ] && ShowError "sum of requested partitions is greater than sdcard size"
+	[ $(($FATSIZE + $EXTSIZE + $CACHESIZE)) -gt $SDSIZE ] && [ -z "$IMODE" ] && ShowError "sum of requested partitions is greater than sdcard size"
 
 }
 
@@ -282,7 +282,7 @@ ShowActions() {
 	echo "the following actions will be performed:"
 	echo " -create $FATSIZE""MB fat32 partition"
 	[ $EXTSIZE -gt 0 ] && echo " -create $EXTSIZE""MB ext2 partition"
-	[ $SWAPSIZE -gt 0 ] && echo " -create $SWAPSIZE""MB swap partition"
+	[ $CACHESIZE -gt 0 ] && echo " -create $CACHESIZE""MB cache partition"
 	[ "$EXTFS" != "ext2" ] && echo " -ext2 partition will be upgraded to $EXTFS"
 	echo
 	[ -z "$SILENTRUN" ] &&	UserAbort && ShowError "script canceled by user"
@@ -331,9 +331,10 @@ PartitionSdCard() {
 		echo "done"
 	fi
 	
-	if [ $SWAPSIZE -gt 0 ] ; then
-		echo -n "creating swap partition..."
-		"$CMPARTED" -s "$SDPATH" mkpartfs primary linux-swap "$EXTEND"MB "$SWAPEND"MB 2>&1 >>"$LOGFILE"
+	if [ $CACHESIZE -gt 0 ] ; then
+		echo -n "creating cache partition..."
+		"$CMPARTED" -s "$SDPATH" mkpartfs primary ext2 "$EXTEND"MB "$CACHEEND"MB 2>&1 >>"$LOGFILE"
+		"$CMTUNE2FS" -L cache "$CACHEPATH" 2>&1 >>"$LOGFILE"
 		echo "done"
 	fi
 	echo
@@ -358,7 +359,9 @@ UpgradeExt() {
 		echo -n "adding journaling to $EXTPATH..."
 		umount /system/sd > /dev/null 2>&1 >>"$LOGFILE"
 		"$CME2FSCK" -p "$EXTPATH" 2>&1 >>"$LOGFILE"
+		"$CME2FSCK" -p "$CACHEPATH" 2>&1 >>"$LOGFILE"
 		"$CMTUNE2FS" -c0 -i0 -j "$EXTPATH" 2>&1 >>"$LOGFILE"
+		"$CMTUNE2FS" -c0 -i0 -j "$CACHEPATH" 2>&1 >>"$LOGFILE"
 		echo "done"
 	fi
 
@@ -368,6 +371,8 @@ UpgradeExt() {
 		umount /system/sd > /dev/null 2>&1 >>"$LOGFILE"
 		"$CMTUNE2FS" -O extents,uninit_bg,dir_index "$EXTPATH" 2>&1 >>"$LOGFILE"
 		"$CME2FSCK" -fpDC0 "$EXTPATH" 2>&1 >>"$LOGFILE"
+		"$CMTUNE2FS" -O extents,uninit_bg,dir_index "$CACHEPATH" 2>&1 >>"$LOGFILE"
+		"$CME2FSCK" -fpDC0 "$CACHEPATH" 2>&1 >>"$LOGFILE"
 		echo "done"
 	fi
 	echo
@@ -439,23 +444,23 @@ DONEINSTRUCT
 
 GetSwapSize() {
 
-	SWAPTEST=
+	CACHETEST=
 	
-	while [ -z "$SWAPTEST" ]
+	while [ -z "$CACHETEST" ]
 	do
 		echo
-		echo -n "swap partition size [default=$SWAPSIZE]: "
-		read SWAPRESP
+		echo -n "cache partition size [default=$CACHESIZE]: "
+		read CACHERESP
 		
-		[ -z "$SWAPRESP" ] && SWAPRESP="$SWAPSIZE"
-		echo "$SWAPRESP" > /dev/null 2>&1 >>"$LOGFILE"
+		[ -z "$CACHERESP" ] && CACHERESP="$CACHESIZE"
+		echo "$CACHERESP" > /dev/null 2>&1 >>"$LOGFILE"
 		
-		ValidateSizeArg "$SWAPRESP"
-		SWAPTEST="$FUNC_RET"
-		[ -n "$SWAPTEST" ] && [ $SWAPTEST -gt $SDSIZE ] && ShowMessage "$SWAPRESP > available space($(($SDSIZE))M)." && SWAPTEST=
+		ValidateSizeArg "$CACHERESP"
+		CACHETEST="$FUNC_RET"
+		[ -n "$CACHETEST" ] && [ $CACHETEST -gt $SDSIZE ] && ShowMessage "$CACHERESP > available space($(($SDSIZE))M)." && CACHETEST=
 	done
 	
-	SWAPSIZE=$SWAPTEST
+	CACHESIZE=$CACHETEST
 	
 }
 
@@ -475,7 +480,7 @@ GetExtSize() {
 		ValidateSizeArg "$EXTRESP"
 		EXTTEST="$FUNC_RET"
 		
-		[ -n "$EXTTEST" ] && [ $EXTTEST -gt $(($SDSIZE - $SWAPSIZE)) ] && ShowMessage "$EXTRESP > available space($(($SDSIZE - $SWAPSIZE))M)." && EXTTEST=
+		[ -n "$EXTTEST" ] && [ $EXTTEST -gt $(($SDSIZE - $CACHESIZE)) ] && ShowMessage "$EXTRESP > available space($(($SDSIZE - $CACHESIZE))M)." && EXTTEST=
 	done
 	
 	EXTSIZE=$EXTTEST
@@ -519,7 +524,7 @@ GetFatSize() {
 		ValidateSizeArg "$FATRESP"
 		FATTEST="$FUNC_RET"
 		
-		[ -n "$FATTEST" ] && [ $FATTEST -gt $FATSIZE ] && ShowMessage "$FATRESP > available space($(($SDSIZE - $SWAPSIZE - $EXTSIZE))M)." && FATTEST=
+		[ -n "$FATTEST" ] && [ $FATTEST -gt $FATSIZE ] && ShowMessage "$FATRESP > available space($(($SDSIZE - $CACHESIZE - $EXTSIZE))M)." && FATTEST=
 		[ -n "$FATTEST" ] && [ $FATTEST -le 0 ] && ShowMessage "must have a fat32 partition greater than 0MB" && FATTEST=
 	done
 	
@@ -546,13 +551,13 @@ TTISMSDOS=
 
 SDSIZE=
 SDSIZEMB=
-SDINFO=$(cat /etc/fstab | grep /sdcard | awk '{print $1}')
-if [ -L "$SDINFO" ]
-then
-	SDPATH=$(ls -l $SDINFO | awk '{print $11}')
-else
-	SDPATH=$SDINFO
-fi
+#SDINFO=$(cat /etc/fstab | grep /sdcard | awk '{print $1}')
+#if [ -L "$SDINFO" ]
+#then
+#	SDPATH=$(ls -l $SDINFO | awk '{print $11}')
+#else
+#	SDPATH=$SDINFO
+#fi
 # we may now have an SDPATH, let's make sure its on mmcblkX or mmcblkXp1
 CHECK_SDPATH1=$(echo $SDPATH | grep mmcblk.$)
 CHECK_SDPATH2=$(echo $SDPATH | grep mmcblk.p1$)
@@ -579,10 +584,10 @@ EXTFS="ext2"
 EXTPATH=$SDPATH"p2"
 EXTEND=
 
-SWAPSIZE=32
-SWAPTYPE="linux-swap"
-SWAPPATH=$SDPATH"p3"
-SWAPEND=
+CACHESIZE=32
+CACHETYPE="linux-cache"
+CACHEPATH=$SDPATH"p3"
+CACHEEND=
 
 CMPARTED="/sbin/parted"
 CMTUNE2FS="/sbin/tune2fs"
@@ -600,7 +605,7 @@ while [ $# -gt 0 ] ; do
     
     -fs|--fatsize) shift ; ValidateSizeArg "$1" ; FATSIZE="$FUNC_RET" ; CREATEPART="$1" ;;
     -es|--extsize) shift ; ValidateSizeArg "$1" ; EXTSIZE="$FUNC_RET" ; CREATEPART="$1" ;;
-	-ss|--swapsize) shift ; ValidateSizeArg "$1" ; SWAPSIZE="$FUNC_RET" ; CREATEPART="$1" ;;
+	-ss|--cachesize) shift ; ValidateSizeArg "$1" ; CACHESIZE="$FUNC_RET" ; CREATEPART="$1" ;;
 	-efs|--extfs) shift ; ValidateExtArg "$1" ; EXTFS="$FUNC_RET" ; CREATEPART="$1" ;;
 	
 	-ufs|--upgradefs) shift ; ValidateExtArg "$1" ; UEXTFSONLY="$FUNC_RET" ;;

@@ -128,11 +128,7 @@ void show_install_update_menu()
                                     NULL };
 
     char *other_sd = NULL;
-    if (volume_for_path("/emmc") != NULL) {
-        other_sd = "/emmc/";
-        install_menu_items[3] = "choose zip from internal sdcard";
-    }
-    else if (volume_for_path("/external_sd") != NULL) {
+    if (volume_for_path("/external_sd") != NULL) {
         other_sd = "/external_sd/";
         install_menu_items[3] = "choose zip from external sdcard";
     }
@@ -487,10 +483,15 @@ int control_usb_storage_set_lun(Volume* vol, bool enable, const char *lun_file) 
     }
 }
 
+#define STRINGIFY(s) #s
+
 int control_usb_storage_for_lun(Volume* vol, bool enable) {
     static const char* lun_files[] = {
 #ifdef BOARD_UMS_LUNFILE
         BOARD_UMS_LUNFILE,
+#endif
+#ifdef TARGET_USE_CUSTOM_LUN_FILE_PATH
+        STRINGIFY(TARGET_USE_CUSTOM_LUN_FILE_PATH),
 #endif
         "/sys/devices/platform/usb_mass_storage/lun%d/file",
         "/sys/class/android_usb/android0/f_mass_storage/lun/file",
@@ -558,8 +559,6 @@ void show_mount_usb_storage_menu()
 {
     // Build a list of Volume objects; some or all may not be valid
     Volume* volumes[MAX_NUM_USB_VOLUMES] = {
-        volume_for_path("/sdcard"),
-        volume_for_path("/emmc"),
         volume_for_path("/external_sd")
     };
 
@@ -594,7 +593,11 @@ int confirm_selection(const char* title, const char* confirm)
         return 1;
 
     char* confirm_headers[]  = {  title, "  THIS CAN NOT BE UNDONE.", "", NULL };
-    if (0 == stat("/sdcard/clockworkmod/.one_confirm", &info)) {
+    int one_confirm = 0 == stat("/sdcard/clockworkmod/.one_confirm", &info);
+#ifdef BOARD_TOUCH_RECOVERY
+    one_confirm = 1;
+#endif 
+    if (one_confirm) {
         char* items[] = { "No",
                         confirm, //" Yes -- wipe partition",   // [1]
                         NULL };
@@ -757,6 +760,23 @@ int format_unknown_device(const char *device, const char* path, const char *fs_t
     if (strcmp(path, "/data") == 0) {
         sprintf(tmp, "cd /data ; for f in $(ls -a | grep -v ^media$); do rm -rf $f; done");
         __system(tmp);
+        // if the /data/media sdcard has already been migrated for android 4.2,
+        // prevent the migration from happening again by writing the .layout_version
+        struct stat st;
+        if (0 == lstat("/data/media/0", &st)) {
+            char* layout_version = "2";
+            FILE* f = fopen("/data/.layout_version", "wb");
+            if (NULL != f) {
+                fwrite(layout_version, 1, 2, f);
+                fclose(f);
+            }
+            else {
+                LOGI("error opening /data/.layout_version for write.\n");
+            }
+        }
+        else {
+            LOGI("/data/media/0 not found. migration may occur.\n");
+        }
     }
     else {
         sprintf(tmp, "rm -rf %s/*", path);
@@ -788,7 +808,7 @@ int is_safe_to_format(char* name)
 {
     char str[255];
     char* partition;
-    property_get("ro.cwm.forbid_format", str, "/misc,/radio,/bootloader,/recovery,/efs,/wimax");
+    property_get("ro.cwm.forbid_format", str, "/radio,/bootloader,/recovery,/efs,/wimax");
 
     partition = strtok(str, ", ");
     while (partition != NULL) {
@@ -874,21 +894,44 @@ void show_partition_menu()
 
             options[mountable_volumes+i] = e->txt;
         }
-
+// CREDIT: PhilZ
+        //Mount usb storage support for /data/media devices, by PhilZ (part 1/2)`
         if (!is_data_media()) {
           options[mountable_volumes + formatable_volumes] = "mount USB storage";
           options[mountable_volumes + formatable_volumes + 1] = NULL;
         }
         else {
-          options[mountable_volumes + formatable_volumes] = NULL;
+          options[mountable_volumes + formatable_volumes] = "format /data and /data/media (/sdcard)";
+          options[mountable_volumes + formatable_volumes + 1] = "mount USB storage";
+          options[mountable_volumes + formatable_volumes + 2] = NULL;
         }
+        //end PhilZ support for mount usb storage on /data/media (part 1/2)
 
         int chosen_item = get_menu_selection(headers, &options, 0, 0);
         if (chosen_item == GO_BACK)
             break;
         if (chosen_item == (mountable_volumes+formatable_volumes)) {
+            if (!is_data_media()) {
+                show_mount_usb_storage_menu();
+            }
+            else {
+                if (!confirm_selection("format /data and /data/media (/sdcard)", confirm))
+                    continue;
+                handle_data_media_format(1);
+                ui_print("Formatting /data...\n");
+                if (0 != format_volume("/data"))
+                    ui_print("Error formatting /data!\n");
+                else
+                    ui_print("Done.\n");
+                handle_data_media_format(0);  
+            }
+        }
+// CREDIT: PhilZ
+        //Mount usb storage support for /data/media devices, by PhilZ (part 2/2)
+        else if (is_data_media() && chosen_item == (mountable_volumes+formatable_volumes+1)) {
             show_mount_usb_storage_menu();
         }
+        //end PhilZ support for mount usb storage on /data/media
         else if (chosen_item < mountable_volumes) {
             MountMenuEntry* e = &mount_menu[chosen_item];
             Volume* v = e->v;
@@ -1010,25 +1053,37 @@ static void run_dedupe_gc(const char* other_sd) {
     }
 }
 
-static void choose_backup_format() {
-    static char* headers[] = {  "Backup Format",
+static void choose_default_backup_format() {
+    static char* headers[] = {  "Default Backup Format",
                                 "",
                                 NULL
     };
 
-    char* list[] = { "dup (default)",
-        "tar"
+    char **list;
+    char* list_tar_default[] = { "tar (default)",
+        "dup",
+        NULL
     };
+    char* list_dup_default[] = { "tar",
+        "dup (default)",
+        NULL
+    };
+
+    if (nandroid_get_default_backup_format() == NANDROID_BACKUP_FORMAT_DUP) {
+        list = list_dup_default;
+    } else {
+        list = list_tar_default;
+    }
 
     int chosen_item = get_menu_selection(headers, list, 0, 0);
     switch (chosen_item) {
         case 0:
-            write_string_to_file(NANDROID_BACKUP_FORMAT_FILE, "dup");
-            ui_print("Backup format set to dedupe.\n");
+            write_string_to_file(NANDROID_BACKUP_FORMAT_FILE, "tar");
+            ui_print("Default backup format set to tar.\n");
             break;
         case 1:
-            write_string_to_file(NANDROID_BACKUP_FORMAT_FILE, "tar");
-            ui_print("Backup format set to tar.\n");
+            write_string_to_file(NANDROID_BACKUP_FORMAT_FILE, "dup");
+            ui_print("Default backup format set to dedupe.\n");
             break;
     }
 }
@@ -1045,7 +1100,7 @@ void show_nandroid_menu()
                             "delete",
                             "advanced restore",
                             "free unused backup data",
-                            "choose backup format",
+                            "choose default backup format",
                             NULL,
                             NULL,
                             NULL,
@@ -1056,14 +1111,7 @@ void show_nandroid_menu()
     };
 
     char *other_sd = NULL;
-    if (volume_for_path("/emmc") != NULL) {
-        other_sd = "/emmc";
-        list[6] = "backup to internal sdcard";
-        list[7] = "restore from internal sdcard";
-        list[8] = "advanced restore from internal sdcard";
-        list[9] = "delete from internal sdcard";
-    }
-    else if (volume_for_path("/external_sd") != NULL) {
+    if (volume_for_path("/external_sd") != NULL) {
         other_sd = "/external_sd";
         list[6] = "backup to external sdcard";
         list[7] = "restore from external sdcard";
@@ -1111,7 +1159,7 @@ void show_nandroid_menu()
                 run_dedupe_gc(other_sd);
                 break;
             case 5:
-                choose_backup_format();
+                choose_default_backup_format();
                 break;
             case 6:
                 {
@@ -1169,37 +1217,20 @@ void show_nandroid_menu()
     }
 }
 
-void wipe_battery_stats()
-{
-    ensure_path_mounted("/data");
-    remove("/data/system/batterystats.bin");
-    ensure_path_unmounted("/data");
-    ui_print("Battery Stats wiped.\n");
-}
-
 static void partition_sdcard(const char* volume) {
     if (!can_partition(volume)) {
         ui_print("Can't partition device: %s\n", volume);
         return;
     }
 
-    static char* ext_sizes[] = { "128M",
-                                 "256M",
-                                 "512M",
-                                 "1024M",
-                                 "2048M",
-                                 "4096M",
+    static char* ext_sizes[] = { "15G",
                                  NULL };
 
-    static char* swap_sizes[] = { "0M",
-                                  "32M",
-                                  "64M",
-                                  "128M",
-                                  "256M",
+    static char* swap_sizes[] = { "300M",
                                   NULL };
 
-    static char* ext_headers[] = { "Ext Size", "", NULL };
-    static char* swap_headers[] = { "Swap Size", "", NULL };
+    static char* ext_headers[] = { "Data Size", "", NULL };
+    static char* swap_headers[] = { "Cache Size", "", NULL };
 
     int ext_size = get_menu_selection(ext_headers, ext_sizes, 0, 0);
     if (ext_size == GO_BACK)
@@ -1216,12 +1247,12 @@ static void partition_sdcard(const char* volume) {
     sddevice[strlen("/dev/block/mmcblkX")] = NULL;
     char cmd[PATH_MAX];
     setenv("SDPATH", sddevice, 1);
-    sprintf(cmd, "sdparted -es %s -ss %s -efs ext3 -s", ext_sizes[ext_size], swap_sizes[swap_size]);
-    ui_print("Partitioning SD Card... please wait...\n");
+    sprintf(cmd, "sdparted -es %s -ss %s -efs ext4 -s", ext_sizes[ext_size], swap_sizes[swap_size]);
+    ui_print("Partitioning Internal Storage... please wait...\n");
     if (0 == __system(cmd))
         ui_print("Done!\n");
     else
-        ui_print("An error occured while partitioning your SD Card. Please see /tmp/recovery.log for more details.\n");
+        ui_print("An error occured while partitioning your Internal Storage. Please see /tmp/recovery.log for more details.\n");
 }
 
 int can_partition(const char* volume) {
@@ -1233,7 +1264,7 @@ int can_partition(const char* volume) {
 
     int vol_len = strlen(vol->device);
     // do not allow partitioning of a device that isn't mmcblkX or mmcblkXp1
-    if (vol->device[vol_len - 2] == 'p' && vol->device[vol_len - 2] != '1') {
+    if (vol->device[vol_len - 2] == 'p' && vol->device[vol_len - 1] != '1') {
         LOGI("Can't partition unsafe device: %s\n", vol->device);
         return 0;
     }
@@ -1253,27 +1284,22 @@ void show_advanced_menu()
                                 NULL
     };
 
-    static char* list[] = { "reboot recovery",
+    static char* list[] = { "power off",
                             "wipe dalvik cache",
-                            "wipe battery stats",
                             "report error",
                             "key test",
                             "show log",
                             "fix permissions",
                             "partition sdcard",
-                            "partition external sdcard",
-                            "partition internal sdcard",
+                            "partition internal storage",
                             NULL
     };
 
     if (!can_partition("/sdcard")) {
-        list[7] = NULL;
-    }
-    if (!can_partition("/external_sd")) {
-        list[8] = NULL;
+        list[6] = NULL;
     }
     if (!can_partition("/emmc")) {
-        list[9] = NULL;
+        list[7] = NULL;
     }
 
     for (;;)
@@ -1284,8 +1310,8 @@ void show_advanced_menu()
         switch (chosen_item)
         {
             case 0:
-                android_reboot(ANDROID_RB_RESTART2, 0, "recovery");
-                break;
+                android_reboot(ANDROID_RB_POWEROFF, 0, 0);
+		    break;
             case 1:
                 if (0 != ensure_path_mounted("/data"))
                     break;
@@ -1300,13 +1326,9 @@ void show_advanced_menu()
                 ensure_path_unmounted("/data");
                 break;
             case 2:
-                if (confirm_selection( "Confirm wipe?", "Yes - Wipe Battery Stats"))
-                    wipe_battery_stats();
-                break;
-            case 3:
                 handle_failure(1);
                 break;
-            case 4:
+            case 3:
             {
                 ui_print("Outputting key codes.\n");
                 ui_print("Go back to end debugging.\n");
@@ -1321,28 +1343,26 @@ void show_advanced_menu()
                 while (action != GO_BACK);
                 break;
             }
-            case 5:
+            case 4:
                 ui_printlogtail(12);
                 break;
-            case 6:
+            case 5:
                 ensure_path_mounted("/system");
                 ensure_path_mounted("/data");
                 ui_print("Fixing permissions...\n");
                 __system("fix_permissions");
                 ui_print("Done!\n");
                 break;
-            case 7:
+            case 6:
                 partition_sdcard("/sdcard");
                 break;
-            case 8:
-                partition_sdcard("/external_sd");
-                break;
-            case 9:
+            case 7:
                 partition_sdcard("/emmc");
                 break;
         }
     }
 }
+
 
 void write_fstab_root(char *path, FILE *file)
 {
